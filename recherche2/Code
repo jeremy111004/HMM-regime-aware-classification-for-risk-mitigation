@@ -1,0 +1,443 @@
+Imports & helpers
+%pip install -U "numpy<2" "scipy<1.13" "scikit-learn<1.4" "hmmlearn<0.4" pandas matplotlib ipykernel
+
+import numpy, scipy, sklearn
+print("NumPy:", numpy.__version__)
+print("SciPy:", scipy.__version__)
+print("sklearn:", sklearn.__version__)
+
+import IPython
+IPython.get_ipython().kernel.do_shutdown(restart=True)
+ 
+# Core
+import numpy as np
+import pandas as pd
+
+# Modeling
+from hmmlearn.hmm import GaussianHMM
+
+# Plotting
+import matplotlib.pyplot as plt
+
+# Reproducibility
+rng = np.random.default_rng(42)
+
+# ---- Helper metrics ----
+def sharpe_ratio(returns, freq=252, eps=1e-12):
+    """Annualized Sharpe from daily returns."""
+    mu = returns.mean() * freq
+    sd = returns.std(ddof=0) * np.sqrt(freq)
+    return mu / (sd + eps)
+
+def max_drawdown(cum_curve):
+    """Max drawdown from cumulative return curve (array-like)."""
+    cum = np.asarray(cum_curve)
+    peak = np.maximum.accumulate(cum)
+    dd = (cum - peak) / peak
+    return dd.min()
+
+def plot_curves(curves_dict, title="Cumulative Returns"):
+    plt.figure(figsize=(10,5))
+    for name, series in curves_dict.items():
+        plt.plot(series.index, series.values, label=name)
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+data
+# --- DATA: load multiple CSVs from data/ and build log returns ---
+import os, glob
+import numpy as np
+import pandas as pd
+
+USE_SYNTHETIC = False  # now using real files
+
+def pick_price_column(df):
+    for c in ["Adj Close", "AdjClose", "Close", "close", "Price", "Adj_Close"]:
+        if c in df.columns:
+            return c
+    # fallback: last numeric column
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if not num_cols:
+        raise ValueError("No numeric price column found.")
+    return num_cols[-1]
+
+def load_prices_folder(folder="data"):
+    series = []
+    files = sorted(glob.glob(os.path.join(folder, "*.csv")))
+    if not files:
+        raise FileNotFoundError("No CSV files found in 'data/'.")
+    for f in files:
+        tkr = os.path.splitext(os.path.basename(f))[0]
+        df = pd.read_csv(f)
+        # parse date
+        date_col = "Date" if "Date" in df.columns else df.columns[0]
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.set_index(date_col).sort_index()
+        col = pick_price_column(df)
+        s = df[col].astype(float).rename(tkr)
+        series.append(s)
+    px = pd.concat(series, axis=1).dropna(how="any")  # common dates
+    px = px[~px.index.duplicated(keep="first")]
+    return px
+
+prices = load_prices_folder("data")
+prices = prices.asfreq("B").fillna(method="ffill")  # align to business days
+print("Assets:", list(prices.columns))
+display(prices.tail())
+
+# log returns
+returns = np.log(prices).diff().dropna()
+display(returns.tail())
+HMM selection (BIC) + fit
+# --- HMM on 21d rolling log-vol of equal-weight portfolio ---
+from hmmlearn.hmm import GaussianHMM
+import numpy as np
+import pandas as pd
+
+ew_ret = returns.mean(axis=1)
+roll_vol = ew_ret.rolling(21).std().dropna()
+vol_signal = np.log(roll_vol.values.reshape(-1, 1) + 1e-12)
+
+# align returns to vol signal index
+R_aligned = returns.loc[roll_vol.index]
+
+def fit_hmm_bic(X, k_min=2, k_max=4, random_state=7, max_iter=500):
+    best_model, best_bic, best_k = None, np.inf, None
+    N = len(X)
+    for k in range(k_min, k_max + 1):
+        m = GaussianHMM(n_components=k, covariance_type="diag", n_iter=max_iter, random_state=random_state)
+        m.fit(X)
+        logL = m.score(X)
+        p = k + k + k*(k-1) + (k-1)
+        bic = -2*logL + p*np.log(N)
+        if bic < best_bic:
+            best_bic, best_model, best_k = bic, m, k
+    return best_k, best_model
+
+best_k, hmm_model = fit_hmm_bic(vol_signal, k_min=2, k_max=4)
+print("Selected states (BIC):", best_k)
+
+states_map = hmm_model.predict(vol_signal)
+state_series = pd.Series(states_map, index=R_aligned.index, name="state")
+state_series.head()
+Regime stats + inverse-vol weights
+# --- mean–variance weights per regime ---
+import numpy as np
+import pandas as pd
+
+def mean_var_weights(returns, lam=5, eps=1e-8):
+    mu = returns.mean().values.reshape(-1, 1)
+    cov = returns.cov().values
+    inv = np.linalg.pinv(cov + eps*np.eye(cov.shape[0]))
+    w = inv @ mu
+    w = w / np.sum(np.abs(w))                 # normalize exposure
+    w = (w * (1 - 1/lam)) + (np.ones_like(w)/len(w)) * (1/lam)  # blend with EW
+    return pd.Series(w.ravel(), index=returns.columns)
+
+regime_weights = {}
+for s in sorted(state_series.unique()):
+    mask = state_series == s
+    R_sub = R_aligned[mask] if mask.sum() >= 30 else R_aligned
+    regime_weights[s] = mean_var_weights(R_sub, lam=5)
+
+regime_weights = pd.DataFrame(regime_weights).T
+regime_weights = regime_weights.clip(-0.5, 0.5)                     # cap exposures
+regime_weights = regime_weights.div(regime_weights.abs().sum(axis=1), axis=0)  # normalize
+regime_weights.index.name = "state"
+display(regime_weights)
+Backtest + plot
+# --- backtest using previous day's regime weights ---
+import matplotlib.pyplot as plt
+
+def plot_curves(curves: dict, title="Cumulative Returns"):
+    plt.figure(figsize=(10,5))
+    for name, series in curves.items():
+        plt.plot(series.index, series.values, label=name)
+    plt.title(title); plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+
+shifted_states = state_series.shift(1).dropna()
+R = R_aligned.loc[shifted_states.index]  # log returns
+
+# Dynamic (HMM)
+W_dyn = pd.DataFrame([regime_weights.loc[s] for s in shifted_states.values],
+                     index=R.index, columns=R.columns)
+
+# Static mean–var
+C_full = R_aligned.cov()
+mu_full = R_aligned.mean().values.reshape(-1,1)
+inv = np.linalg.pinv(C_full + 1e-8*np.eye(C_full.shape[0]))
+w_full = inv @ mu_full
+w_full = w_full / np.sum(np.abs(w_full))
+W_static = pd.DataFrame([w_full.ravel()]*len(R), index=R.index, columns=R.columns)
+
+# Equal weight
+eq = pd.Series(np.ones(R.shape[1])/R.shape[1], index=R.columns)
+W_eq = pd.DataFrame([eq]*len(R), index=R.index, columns=R.columns)
+
+# Portfolio daily log returns
+ret_dyn    = (W_dyn * R).sum(axis=1)
+ret_static = (W_static * R).sum(axis=1)
+ret_eq     = (W_eq * R).sum(axis=1)
+
+# Vol targeting (~10% annual)
+def vol_target(r, lookback=21, target_ann_vol=0.10, lb=0.5, ub=1.5):
+    rv = r.rolling(lookback).std() * np.sqrt(252)
+    lev = (target_ann_vol / rv.replace(0, np.nan)).clip(lb, ub).fillna(1.0)
+    return (lev.shift(1) * r).dropna()
+
+ret_dyn_t    = vol_target(ret_dyn)
+ret_static_t = vol_target(ret_static)
+ret_eq_t     = vol_target(ret_eq)
+
+# Cum curves (log-return compounding)
+cum_dyn    = np.exp(ret_dyn_t.cumsum())
+cum_static = np.exp(ret_static_t.cumsum())
+cum_eq     = np.exp(ret_eq_t.cumsum())
+
+plot_curves(
+    {"Dynamic (HMM)": cum_dyn, "Static": cum_static, "Equal": cum_eq},
+    title="Dynamic Mean–Var (HMM Regimes, 10% Target Vol)"
+)
+KPI
+import numpy as np
+import pandas as pd
+
+def sharpe_ratio(r, freq=252, eps=1e-12):
+    mu = r.mean()*freq
+    sd = r.std(ddof=0)*np.sqrt(freq)
+    return float(mu/(sd+eps))
+
+def max_drawdown(c):
+    x = c.values
+    peak = np.maximum.accumulate(x)
+    dd = (x-peak)/peak
+    return float(dd.min())
+
+summary = pd.DataFrame({
+    "Ann. Sharpe": [sharpe_ratio(ret_dyn_t), sharpe_ratio(ret_static_t), sharpe_ratio(ret_eq_t)],
+    "Max Drawdown": [max_drawdown(cum_dyn), max_drawdown(cum_static), max_drawdown(cum_eq)],
+    "Ann. Return": [ret_dyn_t.mean()*252, ret_static_t.mean()*252, ret_eq_t.mean()*252],
+    "Ann. Vol": [ret_dyn_t.std(ddof=0)*np.sqrt(252),
+                 ret_static_t.std(ddof=0)*np.sqrt(252),
+                 ret_eq_t.std(ddof=0)*np.sqrt(252)],
+}, index=["Dynamic (HMM)", "Static", "Equal"]).round(4)
+
+summary
+Rolling config
+# Rolling params
+ROLL_WINDOW = 504      # ~2 years
+ROLL_STEP   = 21       # refit monthly
+MIN_REG_OBS = 60       # min obs for regime subset
+LAM_MV      = 5        # risk aversion for mean–var
+
+def vol_target(r, lookback=21, target_ann_vol=0.10, lb=0.5, ub=1.5):
+    rv = r.rolling(lookback).std() * np.sqrt(252)
+    lev = (target_ann_vol / rv.replace(0, np.nan)).clip(lb, ub).fillna(1.0)
+    return (lev.shift(1) * r).dropna()
+Rolling backtest & plot
+from hmmlearn.hmm import GaussianHMM
+import numpy as np
+import pandas as pd
+
+def fit_hmm_bic(X, k_min=2, k_max=4, random_state=7, max_iter=300):
+    best_model, best_bic, best_k = None, np.inf, None
+    N = len(X)
+    for k in range(k_min, k_max + 1):
+        m = GaussianHMM(n_components=k, covariance_type="diag", n_iter=max_iter, random_state=random_state)
+        m.fit(X); logL = m.score(X)
+        p = k + k + k*(k-1) + (k-1)
+        bic = -2*logL + p*np.log(N)
+        if bic < best_bic:
+            best_bic, best_model, best_k = bic, m, k
+    return best_k, best_model
+
+def mean_var_weights(returns, lam=5, eps=1e-8):
+    mu  = returns.mean().values.reshape(-1, 1)
+    cov = returns.cov().values
+    inv = np.linalg.pinv(cov + eps*np.eye(cov.shape[0]))
+    w   = inv @ mu
+    w   = w / np.sum(np.abs(w))
+    w   = (w * (1 - 1/lam)) + (np.ones_like(w)/len(w))*(1/lam)
+    return pd.Series(w.ravel(), index=returns.columns)
+
+def rolling_hmm_weights(returns: pd.DataFrame,
+                        window=504, step=21, min_reg_obs=60, lam=5):
+    idx = returns.index
+    if len(idx) <= window + step:
+        raise ValueError(f"Not enough data for rolling window={window}. Reduce ROLL_WINDOW.")
+
+    ew = returns.mean(axis=1)  # EW log returns
+    W_chunks = []
+
+    # iterate refit points
+    for t in range(window, len(idx), step):
+        past_ret = returns.iloc[t-window:t]              # past window only
+        rv = ew.iloc[:t].rolling(21).std().dropna()      # past vol proxy
+        if len(rv) < window:
+            continue
+        sig_win = np.log(rv.iloc[-window:].values.reshape(-1,1) + 1e-12)
+
+        # fit HMM on past window
+        k, m = fit_hmm_bic(sig_win, 2, 4)
+        st_hist = m.predict(sig_win)
+        st_now  = st_hist[-1]
+
+        # regime subset from past window
+        mask = (st_hist == st_now)
+        if mask.sum() >= min_reg_obs:
+            # map mask (window-length) to past_ret rows
+            R_sub = past_ret.iloc[np.where(mask)[0]]
+        else:
+            R_sub = past_ret
+
+        # weights for next period
+        w_now = mean_var_weights(R_sub, lam=lam).clip(-0.5, 0.5)
+        w_now = w_now / w_now.abs().sum()
+
+        # fill until next refit or end
+        end_i = min(t + step, len(idx))
+        fill_idx = idx[t:end_i]
+        if len(fill_idx) == 0:
+            continue
+        W_chunks.append(pd.DataFrame([w_now.values]*len(fill_idx),
+                                     index=fill_idx, columns=returns.columns))
+
+    if not W_chunks:
+        raise RuntimeError("Rolling procedure produced no weights. Try smaller ROLL_WINDOW or step.")
+
+    W_roll = pd.concat(W_chunks).sort_index()
+    W_roll = W_roll.loc[~W_roll.index.duplicated(keep="first")]
+    return W_roll
+
+# ---- build rolling weights ----
+W_dyn_roll = rolling_hmm_weights(
+    returns,
+    window=ROLL_WINDOW,
+    step=ROLL_STEP,
+    min_reg_obs=MIN_REG_OBS,
+    lam=LAM_MV
+)
+
+print("W_dyn_roll shape:", W_dyn_roll.shape, "| start:", W_dyn_roll.index.min(), "| end:", W_dyn_roll.index.max())
+display(W_dyn_roll.tail())
+Rolling KPI
+# --- Rolling backtest (OOS), plots, and KPIs ---
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# helpers (lightweight)
+def mean_var_weights(returns, lam=5, eps=1e-8):
+    mu  = returns.mean().values.reshape(-1, 1)
+    cov = returns.cov().values
+    inv = np.linalg.pinv(cov + eps*np.eye(cov.shape[0]))
+    w   = inv @ mu
+    w   = w / np.sum(np.abs(w))
+    w   = (w * (1 - 1/lam)) + (np.ones_like(w)/len(w))*(1/lam)
+    return pd.Series(w.ravel(), index=returns.columns)
+
+def vol_target(r, lookback=21, target_ann_vol=0.10, lb=0.5, ub=1.5):
+    rv = r.rolling(lookback).std() * np.sqrt(252)
+    lev = (target_ann_vol / rv.replace(0, np.nan)).clip(lb, ub).fillna(1.0)
+    return (lev.shift(1) * r).dropna()
+
+def sharpe_ratio(r, freq=252, eps=1e-12):
+    mu = r.mean()*freq
+    sd = r.std(ddof=0)*np.sqrt(freq)
+    return float(mu/(sd+eps))
+
+def max_drawdown(c):
+    x = c.values
+    peak = np.maximum.accumulate(x)
+    dd = (x-peak)/peak
+    return float(dd.min())
+
+def plot_curves(curves: dict, title="Cumulative Returns (Rolling OOS)"):
+    plt.figure(figsize=(10,5))
+    for name, series in curves.items():
+        plt.plot(series.index, series.values, label=name)
+    plt.title(title); plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+
+# 1) align weights and returns
+if "W_dyn_roll" not in globals():
+    raise RuntimeError("W_dyn_roll not found. Run Cell 10 first.")
+
+common_idx = W_dyn_roll.index.intersection(returns.index)
+W_dyn_roll = W_dyn_roll.loc[common_idx]
+R_roll     = returns.loc[common_idx]
+
+# 2) dynamic OOS returns (next-day application)
+ret_dyn_roll = (W_dyn_roll.shift(1) * R_roll).sum(axis=1).dropna()
+
+# 3) static OOS baseline: fit before start (use last ROLL_WINDOW days if available)
+start_ts = ret_dyn_roll.index[0]
+start_pos = returns.index.get_loc(start_ts)
+win = min(ROLL_WINDOW if "ROLL_WINDOW" in globals() else 504, start_pos)
+R_first = returns.iloc[start_pos-win:start_pos] if win > 0 else returns.iloc[:start_pos]
+w_static_oos = mean_var_weights(R_first if len(R_first)>10 else returns.iloc[:start_pos], lam=LAM_MV if "LAM_MV" in globals() else 5)
+W_static_oos = pd.DataFrame([w_static_oos.values]*len(ret_dyn_roll.index),
+                            index=ret_dyn_roll.index, columns=returns.columns)
+ret_static_roll = (W_static_oos * returns.loc[ret_dyn_roll.index]).sum(axis=1)
+
+# 4) equal-weight OOS baseline
+eq = pd.Series(np.ones(returns.shape[1])/returns.shape[1], index=returns.columns)
+W_eq_oos = pd.DataFrame([eq.values]*len(ret_dyn_roll.index),
+                        index=ret_dyn_roll.index, columns=returns.columns)
+ret_eq_roll = (W_eq_oos * returns.loc[ret_dyn_roll.index]).sum(axis=1)
+
+# 5) vol targeting (same rule for all)
+ret_dyn_roll_t    = vol_target(ret_dyn_roll)
+ret_static_roll_t = vol_target(ret_static_roll)
+ret_eq_roll_t     = vol_target(ret_eq_roll)
+
+# 6) cumulative curves (log returns)
+cum_dyn_roll    = np.exp(ret_dyn_roll_t.cumsum())
+cum_static_roll = np.exp(ret_static_roll_t.cumsum())
+cum_eq_roll     = np.exp(ret_eq_roll_t.cumsum())
+
+plot_curves({
+    "Dynamic (HMM, rolling)": cum_dyn_roll,
+    "Static (OOS baseline)":  cum_static_roll,
+    "Equal (OOS)":            cum_eq_roll,
+}, "Dynamic Mean–Var with HMM Regimes — Rolling OOS (10% target)")
+
+# 7) KPIs
+summary_roll = pd.DataFrame({
+    "Ann. Sharpe": [sharpe_ratio(ret_dyn_roll_t), sharpe_ratio(ret_static_roll_t), sharpe_ratio(ret_eq_roll_t)],
+    "Max Drawdown": [max_drawdown(cum_dyn_roll), max_drawdown(cum_static_roll), max_drawdown(cum_eq_roll)],
+    "Ann. Return": [ret_dyn_roll_t.mean()*252, ret_static_roll_t.mean()*252, ret_eq_roll_t.mean()*252],
+    "Ann. Vol": [ret_dyn_roll_t.std(ddof=0)*np.sqrt(252),
+                 ret_static_roll_t.std(ddof=0)*np.sqrt(252),
+                 ret_eq_roll_t.std(ddof=0)*np.sqrt(252)],
+}, index=["Dynamic (HMM, rolling)", "Static (OOS baseline)", "Equal (OOS)"]).round(4)
+
+display(summary_roll)
+ROLL_WINDOW = 504    # ~2y
+ROLL_STEP   = 21     # monthly refit
+MIN_REG_OBS = 60
+LAM_GRID    = [3,5,8]          # mean–var risk aversion
+VT_GRID     = [0.08,0.10,0.12] # vol targets
+SMOOTH_ALPHA = 0.3             # w_t = α w_now + (1-α) w_{t-1}
+import numpy as np, pandas as pd
+from sklearn.covariance import LedoitWolf
+
+def cov_lw(X):
+    lw = LedoitWolf().fit(X.values)
+    return pd.DataFrame(lw.covariance_, index=X.columns, columns=X.columns)
+
+def mean_var_weights(returns, lam=5, eps=1e-8):
+    mu  = returns.mean().values.reshape(-1,1)
+    C   = cov_lw(returns)
+    inv = np.linalg.pinv(C.values + eps*np.eye(C.shape[0]))
+    w   = inv @ mu
+    w   = w / np.sum(np.abs(w))
+    w   = (w * (1 - 1/lam)) + (np.ones_like(w)/len(w))*(1/lam)  # blend with EW
+    return pd.Series(w.ravel(), index=returns.columns)
+
+def vol_target(r, lookback=21, target_ann_vol=0.10, lb=0.5, ub=1.5):
+    rv = r.rolling(lookback).std() * np.sqrt(252)
+    lev = (target_ann_vol / rv.replace(0, np.nan)).clip(lb, ub).fillna(1.0)
+    return (lev.shift(1) * r).dropna()
+ 
